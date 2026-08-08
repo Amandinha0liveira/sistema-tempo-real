@@ -1,0 +1,272 @@
+/*
+ * ROBUSTEZ COM FREERTOS: SOFT, FIRM E HARD REAL-TIME (DEMONSTRATIVO)
+ * ------------------------------------------------------------------
+ * Este programa possui tres cenarios possiveis:
+ *
+ * 1 - SOFT REAL-TIME
+ *     Perder um prazo reduz a qualidade, mas a amostra ainda pode ser usada.
+ *     Exemplo: telemetria, log ou painel de monitoramento.
+ *
+ * 2 - FIRM REAL-TIME
+ *     Uma amostra atrasada perde o valor e e descartada, mas um atraso isolado
+ *     nao causa falha total. Exemplo: leitura periodica de monitoramento.
+ *
+ * 3 - HARD REAL-TIME
+ *     Todo prazo deve ser cumprido. Um timeout ou deadline perdido e tratado
+ *     imediatamente como falha critica e aciona o alarme.
+ *
+ *  Após a simulação desses tres cenarios, podemos dizer que o nosso código é HARD REAL-TIME
+ *  porque cada amostra possui um deadline obrigatório de 150 milissegundos. O sistema registra 
+ *  o momento em que a amostra é criada e verifica quanto tempo ela levou para chegar ao processamento. 
+ *  Se ultrapassar o prazo, mesmo que o valor esteja correto, a amostra é descartada e o alarme é acionado 
+ *  imediatamente. Além disso, o primeiro timeout já é tratado como uma falha crítica e a tarefa de 
+ *  processamento possui prioridade elevada. Portanto, a correção do sistema depende tanto do resultado 
+ *  quanto do momento em que ele é produzido
+ *
+ */
+
+#include <Arduino.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+#define CENARIO 1  // Altere para 1 (Soft), 2 (Firm) ou 3 (Hard demonstrativo).
+
+#if CENARIO < 1 || CENARIO > 3
+#error "CENARIO deve ser 1, 2 ou 3."
+#endif
+
+// Pinos do circuito.
+constexpr uint8_t BTN_FAULT_PIN = 4;  // Botao ligado ao GND; usa INPUT_PULLUP.
+constexpr uint8_t LED_OK_PIN    = 2;  // Pisca quando uma amostra valida e processada.
+constexpr uint8_t LED_ERR_PIN   = 19; // Pisca quando o alarme recebe uma falha.
+
+/* Uma amostra leva o valor e o instante em que foi produzida. Isso permite
+ * calcular sua idade e verificar objetivamente se o deadline foi perdido. */
+struct Sample {
+  int value;
+  TickType_t createdAt;
+};
+
+/* Cada perfil altera periodo, deadline, timeout e tolerancia. O mesmo codigo
+ * passa a se comportar como Soft, Firm ou Hard demonstrativo. */
+#if CENARIO == 1
+constexpr char SCENARIO_NAME[]       = "SOFT REAL-TIME";
+constexpr uint32_t SENSOR_PERIOD_MS  = 500;  // Producao relativamente lenta.
+constexpr uint32_t SAMPLE_DEADLINE_MS = 1500; // Atraso e indesejado, mas tolerado.
+constexpr uint32_t RECV_TIMEOUT_MS   = 1000;
+constexpr uint32_t SEND_TIMEOUT_MS   = 100;
+constexpr uint8_t FAILS_TO_ALARM     = 5;    // Tolera cinco timeouts consecutivos.
+constexpr bool DISCARD_LATE_SAMPLE   = false;
+constexpr bool ALARM_ON_FIRST_MISS   = false;
+constexpr UBaseType_t PROCESS_PRIORITY = 3;
+
+#elif CENARIO == 2
+constexpr char SCENARIO_NAME[]       = "FIRM REAL-TIME";
+constexpr uint32_t SENSOR_PERIOD_MS  = 300;
+constexpr uint32_t SAMPLE_DEADLINE_MS = 500; // Depois disso, a amostra nao tem valor.
+constexpr uint32_t RECV_TIMEOUT_MS   = 600;
+constexpr uint32_t SEND_TIMEOUT_MS   = 30;
+constexpr uint8_t FAILS_TO_ALARM     = 3;
+constexpr bool DISCARD_LATE_SAMPLE   = true; // Descarta o dado vencido.
+constexpr bool ALARM_ON_FIRST_MISS   = false;
+constexpr UBaseType_t PROCESS_PRIORITY = 4;
+
+#else
+constexpr char SCENARIO_NAME[]       = "HARD REAL-TIME (DEMONSTRATIVO)";
+constexpr uint32_t SENSOR_PERIOD_MS  = 100;
+constexpr uint32_t SAMPLE_DEADLINE_MS = 150; // Prazo curto e obrigatorio no exemplo.
+constexpr uint32_t RECV_TIMEOUT_MS   = 200;
+constexpr uint32_t SEND_TIMEOUT_MS   = 10;
+constexpr uint8_t FAILS_TO_ALARM     = 1;    // A primeira perda ja e critica.
+constexpr bool DISCARD_LATE_SAMPLE   = true;
+constexpr bool ALARM_ON_FIRST_MISS   = true;
+constexpr UBaseType_t PROCESS_PRIORITY = 5;  // Processamento recebe maior prioridade.
+#endif
+
+constexpr uint32_t MUTEX_TIMEOUT_MS = 100;
+constexpr uint32_t ALARM_WAIT_MS    = 5000;
+constexpr uint32_t DEBOUNCE_MS      = 200;
+constexpr uint8_t QUEUE_LENGTH      = 5;
+
+QueueHandle_t sampleQueue = nullptr; // Fila desacopla Sensor e Processamento.
+SemaphoreHandle_t semAlarm = nullptr; // Semaforo binario sinaliza uma falha ao Alarme.
+SemaphoreHandle_t mtxCounter = nullptr; // Mutex protege o contador compartilhado.
+
+int processed = 0;                    // Total de amostras processadas no prazo.
+volatile bool faultInjected = false;  // true interrompe a producao para simular falha.
+
+void signalAlarm(const char *reason) {
+  Serial.print("[FALHA] ");
+  Serial.println(reason);
+  xSemaphoreGive(semAlarm);
+}
+
+void TaskSensor(void *pv) {
+  TickType_t lastWake = xTaskGetTickCount();
+
+  while (true) {
+    if (!faultInjected) {
+      Sample sample{random(0, 100), xTaskGetTickCount()};
+
+      if (xQueueSend(sampleQueue, &sample, pdMS_TO_TICKS(SEND_TIMEOUT_MS)) != pdTRUE) {
+        Serial.println("[SENSOR] fila cheia, amostra descartada");
+        if (ALARM_ON_FIRST_MISS) signalAlarm("fila cheia no cenario Hard");
+      }
+    } else {
+      Serial.println("[SENSOR] falha injetada, producao parada");
+    }
+
+    // vTaskDelayUntil reduz a deriva e preserva melhor a periodicidade da tarefa.
+    vTaskDelayUntil(&lastWake, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
+  }
+}
+
+void TaskProcess(void *pv) {
+  Sample received;
+  uint8_t failStreak = 0;
+
+  while (true) {
+    if (xQueueReceive(sampleQueue, &received,
+                      pdMS_TO_TICKS(RECV_TIMEOUT_MS)) == pdTRUE) {
+      if (failStreak > 0) {
+        Serial.println("[PROC] fluxo restabelecido");
+        failStreak = 0;
+      }
+
+      const uint32_t ageMs =
+          (xTaskGetTickCount() - received.createdAt) * portTICK_PERIOD_MS;
+      const bool deadlineMissed = ageMs > SAMPLE_DEADLINE_MS;
+
+      Serial.print("[PROC] valor: ");
+      Serial.print(received.value);
+      Serial.print(" | idade: ");
+      Serial.print(ageMs);
+      Serial.println(" ms");
+
+      if (deadlineMissed) {
+        Serial.println("[PROC] deadline perdido");
+
+        if (DISCARD_LATE_SAMPLE) {
+          Serial.println("[PROC] amostra vencida descartada");
+          if (ALARM_ON_FIRST_MISS) signalAlarm("deadline perdido no cenario Hard");
+          continue;
+        }
+
+        // No Soft, o atraso e registrado, mas o dado ainda pode ser processado.
+        Serial.println("[PROC] Soft: processando mesmo com atraso");
+      }
+
+      if (xSemaphoreTake(mtxCounter,
+                         pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
+        processed++;
+        xSemaphoreGive(mtxCounter);
+      } else {
+        signalAlarm("nao foi possivel acessar o contador");
+      }
+
+      digitalWrite(LED_OK_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(30));
+      digitalWrite(LED_OK_PIN, LOW);
+
+    } else {
+      failStreak++;
+      Serial.print("[PROC] timeout sem dados: ");
+      Serial.println(failStreak);
+
+      // No Soft/Firm, tenta recuperar antes do alarme. No Hard, nao espera.
+      if (!ALARM_ON_FIRST_MISS && failStreak == 2) {
+        Serial.println("[PROC] recuperacao: esvaziando a fila");
+        xQueueReset(sampleQueue);
+      }
+
+      if (failStreak >= FAILS_TO_ALARM) {
+        signalAlarm("fluxo de dados interrompido");
+        failStreak = 0;
+      }
+    }
+  }
+}
+
+void TaskAlarm(void *pv) {
+  while (true) {
+    if (xSemaphoreTake(semAlarm, pdMS_TO_TICKS(ALARM_WAIT_MS)) == pdTRUE) {
+      int total = -1;
+
+      if (xSemaphoreTake(mtxCounter,
+                         pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
+        total = processed;
+        xSemaphoreGive(mtxCounter);
+      }
+
+      Serial.print("[ALARME] evento critico. Amostras validas: ");
+      Serial.println(total);
+
+      for (int i = 0; i < 3; i++) {
+        digitalWrite(LED_ERR_PIN, HIGH);
+        vTaskDelay(pdMS_TO_TICKS(150));
+        digitalWrite(LED_ERR_PIN, LOW);
+        vTaskDelay(pdMS_TO_TICKS(150));
+      }
+    } else {
+      Serial.println("[ALARME] sem novos eventos no intervalo");
+    }
+  }
+}
+
+void TaskButton(void *pv) {
+  int lastBtn = HIGH;
+
+  while (true) {
+    const int btn = digitalRead(BTN_FAULT_PIN);
+
+    if (lastBtn == HIGH && btn == LOW) {
+      faultInjected = !faultInjected;
+      Serial.print("[BOTAO] falha injetada: ");
+      Serial.println(faultInjected ? "SIM" : "NAO");
+      vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+    }
+
+    lastBtn = btn;
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BTN_FAULT_PIN, INPUT_PULLUP);
+  pinMode(LED_OK_PIN, OUTPUT);
+  pinMode(LED_ERR_PIN, OUTPUT);
+  digitalWrite(LED_OK_PIN, LOW);
+  digitalWrite(LED_ERR_PIN, LOW);
+
+  sampleQueue = xQueueCreate(QUEUE_LENGTH, sizeof(Sample));
+  semAlarm = xSemaphoreCreateBinary();
+  mtxCounter = xSemaphoreCreateMutex();
+
+  if (!sampleQueue || !semAlarm || !mtxCounter) {
+    Serial.println("[ERRO] nao foi possivel criar os objetos do FreeRTOS");
+    while (true) delay(1000);
+  }
+
+  Serial.println("========================================");
+  Serial.print("Cenario selecionado: ");
+  Serial.println(SCENARIO_NAME);
+  Serial.print("Deadline da amostra: ");
+  Serial.print(SAMPLE_DEADLINE_MS);
+  Serial.println(" ms");
+  Serial.println("Botao GPIO 4: injeta/remove a falha");
+  Serial.println("========================================");
+
+  xTaskCreate(TaskSensor, "Sensor", 2048, nullptr, 3, nullptr);
+  xTaskCreate(TaskProcess, "Process", 3072, nullptr, PROCESS_PRIORITY, nullptr);
+  xTaskCreate(TaskAlarm, "Alarm", 2048, nullptr, 4, nullptr);
+  xTaskCreate(TaskButton, "Button", 2048, nullptr, 2, nullptr);
+}
+
+void loop() {
+  // Vazio: toda a aplicacao e executada pelas tarefas do FreeRTOS.
+}
